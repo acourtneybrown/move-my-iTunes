@@ -1,13 +1,22 @@
 package com.notcharlie.itunes.move;
 
 import java.io.File;
-import java.io.UnsupportedEncodingException;
+import java.io.IOException;
 import java.net.URI;
-import java.net.URISyntaxException;
-import java.net.URLDecoder;
 
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.filefilter.IOFileFilter;
+import org.apache.commons.io.filefilter.SuffixFileFilter;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.jaudiotagger.audio.AudioFile;
+import org.jaudiotagger.audio.AudioFileIO;
+import org.jaudiotagger.audio.exceptions.CannotReadException;
+import org.jaudiotagger.audio.exceptions.InvalidAudioFrameException;
+import org.jaudiotagger.audio.exceptions.ReadOnlyFileException;
+import org.jaudiotagger.tag.FieldKey;
+import org.jaudiotagger.tag.Tag;
+import org.jaudiotagger.tag.TagException;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -15,19 +24,11 @@ import org.kohsuke.args4j.ExampleMode;
 import org.kohsuke.args4j.Option;
 
 import com.dd.plist.NSDictionary;
-import com.dd.plist.NSNumber;
 import com.dd.plist.NSObject;
-import com.dd.plist.NSString;
 import com.dd.plist.PropertyListParser;
 
 public class Main {
     private static final Log log = LogFactory.getLog(Main.class);
-    private static final String TRACKS = "Tracks";
-    private static final String LOCATION = "Location";
-    private static final String TRACK_NUMBER = "Track Number";
-    private static final String NAME = "Name";
-    private static final String ALBUM = "Album";
-    private static final String ARTIST = "Artist";
     
     @Option(name = "-i", usage = "Filename of the existing iTunes XML music library to use")
     private File inputLibrary = new File("Library.xml");
@@ -36,53 +37,58 @@ public class Main {
     private File outputLibrary = new File("Library-new.xml");
 
     @Argument(index = 0, required = true)
-    private String oldRoot = File.separator;
-//    private File oldRoot = new File(".");
-    
-    @Argument(index = 1)
     private String newRoot = ".";
-//    private File newRoot = new File(".");
 
     public static void main(String[] args) {
         new Main().doMain(args);
+        log.debug("Completed run");
     }
 
     public void doMain(String[] args) {
         processArguments(args);
         
-        NSDictionary library = loadLibrary();
-        NSDictionary tracks = (NSDictionary) library.objectForKey(TRACKS);
-        for (String trackKey : tracks.allKeys()) {
-            NSDictionary trackDictionary = (NSDictionary) tracks.objectForKey(trackKey);
-            NSString location = (NSString) trackDictionary.objectForKey(LOCATION);
-            log.debug(String.format("#%s -> %s", trackKey, location));
-            String newLocation = location.toString().replace(oldRoot, newRoot);
-            
-            URI uri;
-            try {
-                uri = new URI(newLocation);
-            } catch (URISyntaxException e) {
-                log.error(String.format("Invalid URI from <%s>", newLocation));
-                throw new RuntimeException(e);
-            }
-            File newFile = new File(uri.getPath());
-            if (!newFile.exists()) {
-                NSNumber trackNumber = (NSNumber) trackDictionary.objectForKey(TRACK_NUMBER);
-                NSString trackName = (NSString) trackDictionary.objectForKey(NAME);
-                NSString trackAlbum = (NSString) trackDictionary.objectForKey(ALBUM);
-                NSString trackArtist = (NSString) trackDictionary.objectForKey(ARTIST);
-                
-                log.warn(String.format("No file at new location <%s>", newLocation));
-                File nextSearch = newFile;
-                while (!nextSearch.exists()) {
-                    nextSearch = nextSearch.getParentFile();
-                }
-                log.debug(String.format("Found existing directory <%s>", nextSearch.getPath()));
-                URI foundFile = searchFile(nextSearch, trackNumber.longValue(), trackName.toString(),
-                        trackAlbum.toString(), trackArtist.toString());
+        NSDictionary library = loadXmlLibrary();
+        ITunesLibrary itunesLibrary = new ITunesLibrary(library);
+        String[] extensions = {".mp3", ".m4a"};
+        IOFileFilter audioFilesFilter = new SuffixFileFilter(extensions);
+        IOFileFilter removeDotDirectories = new IOFileFilter() {
+            @Override
+            public boolean accept(File file) {
+                String name = file.getName();
+                return !name.startsWith(".");
             }
 
-            trackDictionary.put(LOCATION, newLocation);
+            @Override
+            public boolean accept(File dir, String name) {
+                return !name.startsWith(".");
+            }
+        };
+        for (File file : FileUtils.listFiles(new File(newRoot), audioFilesFilter, removeDotDirectories)) {
+            AudioFile audioFile;
+            try {
+                audioFile = AudioFileIO.read(file);
+            } catch (CannotReadException | IOException | TagException | ReadOnlyFileException
+                    | InvalidAudioFrameException e) {
+                log.error(String.format("Problem decoding audio file <%s>", file));
+                throw new RuntimeException(e);
+            }
+            Tag tag = audioFile.getTag();
+            Long trackNumber = null;
+            try {
+                trackNumber = Long.parseLong(tag.getFirst(FieldKey.TRACK));
+            } catch (NumberFormatException e) {
+                // do nothing
+            }
+            String artist = tag.getFirst(FieldKey.ARTIST);
+            String album = tag.getFirst(FieldKey.ALBUM);
+            String trackName = tag.getFirst(FieldKey.TITLE);
+            NSDictionary trackDictionary = itunesLibrary.findTrack(trackNumber, artist, album, trackName);
+            if (trackDictionary != null) {
+                log.debug(String.format("Changing Location for <%s> to <%s>", trackDictionary, file.toURI()));
+            } else {
+                log.warn(String.format("No iTunes track found for <%s> <%s> <%s> <%s>", trackNumber, artist, album,
+                        trackName));
+            }
         }
     }
     
@@ -90,7 +96,7 @@ public class Main {
         return null;
     }
     
-    private NSDictionary loadLibrary() {
+    private NSDictionary loadXmlLibrary() {
         NSObject library;
         try {
             library = PropertyListParser.parse(inputLibrary);
